@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: manifest-demo
+  namespace: k8s-learning
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: manifest-demo
+  template:
+    metadata:
+      labels:
+        app: manifest-demo
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
