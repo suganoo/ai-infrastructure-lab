@@ -1,0 +1,12 @@
+apiVersion: kubeai.org/v1
+kind: Model
+metadata:
+  name: qwen2-0-5b
+  namespace: kubeai
+spec:
+  features:
+    - TextGeneration
+  url: ollama://qwen2:0.5b
+  engine: OLlama
+  resourceProfile: cpu:1
+  minReplicas: 0

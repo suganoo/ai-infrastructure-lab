@@ -59,3 +59,4 @@ AIインフラストラクチャに関する学習・検証・実験を記録す
 - [Kubernetes CPU and memory requests/limits](docs/kubernetes/07-resource-requests-limits.md)
 - [Kubernetes scaling](docs/kubernetes/08-scaling.md)
 - [Kubernetes application management](docs/kubernetes/09-application-management.md)
+- [KubeAI installation and CPU inference](docs/kubeai/01-install-and-cpu-inference.md)
