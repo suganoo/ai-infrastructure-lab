@@ -1,0 +1,12 @@
+apiVersion: kubeai.org/v1
+kind: Model
+metadata:
+  name: qwen25-0-5b-vllm
+  namespace: kubeai
+spec:
+  features:
+    - TextGeneration
+  url: hf://Qwen/Qwen2.5-0.5B-Instruct
+  engine: VLLM
+  resourceProfile: cpu:1
+  minReplicas: 0

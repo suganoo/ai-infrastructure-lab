@@ -199,6 +199,20 @@ Running 1/1
 
 Podが`1/1 Running`になった後、APIから`1+1は2です。`という応答が返った。これはKubeAIがリクエスト時に0台からモデルPodを起動し、Ready後に推論要求を転送した実測である。今回の観測ではPodは約40秒でReadyになった。
 
+## モデルデータの保存とキャッシュ
+
+KubeAIの設定を確認した。
+
+```bash
+kubectl get configmap kubeai-config -n kubeai -o yaml
+```
+
+ConfigMapの`data.system.yaml`では、`resourceProfiles.cpu`がCPU 1、メモリ2Giを要求し、`modelServers.OLlama.images.default`が`ollama/ollama:0.11.11`、`cacheProfiles`は空(`{}`)だった。また、モデルPodの`kubectl describe`ではモデルデータ用PVCのマウントがなく、Startup probe内で`ollama pull`を実行していた。
+
+この実習ではKubeAIの共有キャッシュを構成していない。Pod削除時にPodの書き込み領域も破棄されるため、0台から再起動するとモデルを再取得する可能性がある。ただし、スケールアップ後のpullログは確認していないので、再取得の有無は未検証。
+
+KubeAI公式資料は主なキャッシュ方法として、モデルをコンテナイメージに含める方法と、EFS/NFSなどの共有ファイルシステムにキャッシュする方法を説明している。
+
 ## 参考資料
 
 - [KubeAI: Install on any Kubernetes Cluster](https://www.kubeai.org/installation/any/)
