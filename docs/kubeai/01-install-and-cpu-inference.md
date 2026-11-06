@@ -199,6 +199,10 @@ Running 1/1
 
 Podが`1/1 Running`になった後、APIから`1+1は2です。`という応答が返った。これはKubeAIがリクエスト時に0台からモデルPodを起動し、Ready後に推論要求を転送した実測である。今回の観測ではPodは約40秒でReadyになった。
 
+KubeAI公式のAutoscaling資料によると、モデルPodが0台のときにリクエストが届くと、KubeAIは要求を保持してPodを起動し、Readyになってからバックエンドへ転送する。したがって0台からの起動中は、API応答までにコールドスタートの待ち時間が加わる。今回の実習ではPodの状態遷移と、その後の応答を確認した。
+
+後日`qwen25-0-5b-vllm`のModel YAMLを確認したときは、`minReplicas: 0`に加えて`spec.replicas: 0`、`status.replicas.all: 0`、`ready: 0`だった。`targetRequests: 100`と`scaleDownDelaySeconds: 30`も表示された。前者はモデルサーバーPodごとの平均アクティブリクエスト数の目標、後者はスケールダウン判断後に待つ最小秒数である。実際にPodが0台へ戻ったことも確認したが、複数Podを使った負荷試験やスケーリング閾値の性能検証は行っていない。
+
 ## モデルデータの保存とキャッシュ
 
 KubeAIの設定を確認した。
@@ -213,11 +217,94 @@ ConfigMapの`data.system.yaml`では、`resourceProfiles.cpu`がCPU 1、メモ�
 
 KubeAI公式資料は主なキャッシュ方法として、モデルをコンテナイメージに含める方法と、EFS/NFSなどの共有ファイルシステムにキャッシュする方法を説明している。
 
+## vLLMをCPUで動かす
+
+`kubeai-qwen25-vllm.yaml`で、Qwen2.5-0.5B-InstructをvLLMエンジン、`resourceProfile: cpu:1`、`minReplicas: 0`として登録した。AMD CPUでAVX-512系の命令フラグが確認できる環境で実行し、OpenAI互換APIから日本語の応答を得た。NVIDIA GPU/CUDAは使っていない。
+
+```bash
+kubectl apply -f /mnt/c/Users/sugan/OneDrive/Documents/GitHub/ai-infrastructure-lab/kubernetes/manifests/kubeai-qwen25-vllm.yaml
+kubectl get models,pods -n kubeai -o wide
+kubectl describe pod model-qwen25-0-5b-vllm-6c8c6f77d9-qg2rr -n kubeai
+kubectl logs model-qwen25-0-5b-vllm-6c8c6f77d9-qg2rr -n kubeai --previous
+```
+
+確認したPodは`public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.11.2`を使い、vLLMの起動引数にQwen2.5-0.5B-Instructが指定されていた。`device_config=cpu`とログに出ており、CPUでモデルを読み込んでいる。Tritonはアクティブなドライバーがないため無効化されていた。CPU上ではpin memoryが未対応という警告も出た。
+
+Podのコンテナは1回再起動していた。`describe`では現在`Running`かつ`Ready: True`、前回終了は`Reason: Unknown`、`Exit Code: 255`だった。EventsにはPod sandboxの再作成と、起動中にHTTP health probeがconnection refusedになった記録があり、その後コンテナはReadyになった。`--previous`のログはモデルのダウンロード・ロード後、「Warming up model for the compilation...」で終わっており、終了理由を示すエラーは含まれていなかった。このため、ログだけでは再起動の根本原因は特定できない。API推論の成功と現在Readyであることは確認できたが、再起動原因は未解決として記録する。
+
+この観測から、CPU版vLLMはこの学習環境で小さなモデルを動かせる一方、初回のモデル準備・コンパイルに時間がかかり、コンテナ再起動だけでは原因を断定できないことが分かった。`GPU KV cache size`というログ文言も出たが、同じ起動ログに`device_config=cpu`とあるため、この文言だけでGPUを使ったとは判断しない。
+
+### OllamaとvLLMのModel定義を比較
+
+2つのマニフェストを読み比べた。どちらも`kind: Model`、`features: TextGeneration`、`resourceProfile: cpu:1`、`minReplicas: 0`を指定している。異なるのは主に名前、モデルの取得元である`url`、そして推論エンジンである`engine`。
+
+| Model名 | Engine | URL | 実習で確認したこと |
+| --- | --- | --- | --- |
+| `qwen2-0-5b` | `OLlama` | `ollama://qwen2:0.5b` | OllamaでCPU推論し、API応答を確認 |
+| `qwen25-0-5b-vllm` | `VLLM` | `hf://Qwen/Qwen2.5-0.5B-Instruct` | vLLMのCPUイメージでAPI応答を確認 |
+
+`engine`はモデルサーバーの実装を選び、`url`はその実装に渡すモデルの取得元を示す。KubeAIは両方をOpenAI互換APIの背後に配置する。したがってAPI呼び出し側の形式は共通にできるが、モデル形式やサーバーの起動方法まで同じという意味ではない。KubeAI公式資料では、テキスト生成用エンジンとしてOllamaとvLLMを挙げ、OllamaをCPU向け、vLLMをGPU向けに推奨している。今回のvLLM CPU実行は、手元のCPUで動作を学ぶ実験であり、本番向けの性能比較ではない。
+
+両方のModelが存在している状態で`kubectl get models`を実行したところ、`spec.replicas`とReady数はどちらも0だった。続けて`kubectl get pods -n kubeai`を確認し、KubeAI本体だけが稼働し、モデルサーバーPodがないことを確認した。Model定義の存在と、推論Podの稼働は別の状態である。
+
+## ResourceProfileとPodのCPU・メモリ
+
+KubeAIのConfigMapにある`resourceProfiles.cpu`を確認した。
+
+```yaml
+resourceProfiles:
+  cpu:
+    imageName: cpu
+    requests:
+      cpu: 1
+      memory: 2Gi
+```
+
+Modelの`resourceProfile: cpu:1`は、`cpu`というプロファイルと必要数`1`を指定している。この環境のプロファイルでは、モデルPodのコンテナにCPU `1`、メモリ`2Gi`のrequestsが設定される。以前のvLLM Podの`kubectl describe`でも同じRequests値を確認した。ここではlimitsは定義されていないため、requestsをコンテナの使用上限と解釈しない。
+
+`imageName: cpu`はエンジンごとのイメージ選択にも使われる。ConfigMapでは`modelServers.VLLM.images.cpu`がvLLM CPUイメージに対応し、実際のvLLM Podでも`vllm-cpu-release-repo:v0.11.2`を確認した。GPU用プロファイルにはGPUリソースやtolerationが設定されているが、この実習ではGPUプロファイルを使わず、CPUで推論した。
+
+## モデルデータの取得とキャッシュ
+
+コンテナイメージとモデルデータは別物である。モデルPodのイメージにはvLLMやOllamaなどのサーバープログラムが含まれる一方、`hf://`や`ollama://`のモデルデータは、そのサーバーが別途取得して読み込む。
+
+- Ollama PodのStartup probeでは`ollama pull`、モデル名のコピー、`ollama run`が実行される設定を確認した。
+- vLLMの前回コンテナログでは、Hugging Faceからモデル重みをダウンロードした時間が記録されていた。
+- KubeAIのConfigMapでは`cacheProfiles: {}`で、各Modelにも`cacheProfile`の指定がなく、モデルデータを置くPVCのマウントもPodに見つからなかった。
+
+したがって、この実習ではKubeAIの共有モデルキャッシュを構成していない。新しいPodでモデルを起動するとモデルデータを再取得する可能性があるが、再取得そのものは観測していないため未確認とする。Kubernetes Nodeがコンテナイメージを保持して再利用できても、それだけで別途ダウンロードするモデルデータの保存を意味しない。
+
+KubeAI公式資料では、モデルをサーバー用コンテナイメージに含める方法と、EFS/NFS/Filestoreなどの共有ファイルシステムをキャッシュとして利用する方法を説明している。また、PVCに事前配置したモデルを`pvc://`で参照する方法もある。現在の学習環境では共有ストレージを構成せず、これらの方式の違いを理解するところまでとする。
+
+## KubeAIのModelから推論応答まで
+
+今回の実習で確認したKubeAIの処理をまとめる。
+
+```mermaid
+flowchart LR
+  M[Modelマニフェスト] --> A[Kubernetes API / Model CR]
+  A --> O[KubeAI Model Operator]
+  O -->|EngineとResourceProfileに沿って管理| P[モデルサーバーPod]
+  P -->|モデルデータを取得してロード| L[OllamaまたはvLLM]
+  C[WSLのcurl] --> F[kubectl port-forward]
+  F --> S[KubeAI Service / Proxy]
+  S --> P
+  P --> S --> F --> C
+```
+
+ModelはKubernetesの拡張リソースであり、マニフェストを適用するとKubernetes APIに登録される。KubeAIのOperatorはModelを監視し、指定されたEngineとResourceProfileを使ってモデルサーバーPodを管理する。実際のPodでは`Controlled By: Model/...`を確認した。コンテナ内のOllamaまたはvLLMがモデルデータを読み込み、KubeAI ServiceのOpenAI互換Proxyがクライアントのリクエストをモデルサーバーに中継した。
+
+`minReplicas: 0`の場合、モデルPodが0台のときのリクエストはPod起動中に待たされ、PodがReadyになってから転送される。今回の実測ではPod状態が`Pending`から`Running 1/1`へ進み、その後API応答を得た。アイドル後にはモデルPodが削除されてもModelリソースは残った。これにより、モデルの宣言設定と推論処理を実行するPodのライフサイクルを分けて管理できる。
+
 ## 参考資料
 
 - [KubeAI: Install on any Kubernetes Cluster](https://www.kubeai.org/installation/any/)
 - [KubeAI: Kubernetes compatibility](https://www.kubeai.org/reference/kubernetes-compatibility/)
 - [KubeAI: Backend Servers](https://www.kubeai.org/concepts/backend-servers/)
+- [KubeAI: Autoscaling](https://www.kubeai.org/concepts/autoscaling/)
+- [KubeAI: Storage / Caching](https://www.kubeai.org/concepts/storage-caching/)
+- [KubeAI: Load Models from PVC](https://www.kubeai.org/how-to/load-models-from-pvc/)
 - [KubeAI: Kubernetes API](https://www.kubeai.org/reference/kubernetes-api/)
 - [KubeAI: OpenAI API Compatibility](https://www.kubeai.org/reference/openai-api-compatibility/)
 - [Ollama Library: qwen2](https://ollama.com/library/qwen2)
+- [vLLM: CPU Installation](https://docs.vllm.ai/en/latest/getting_started/installation/cpu/)
